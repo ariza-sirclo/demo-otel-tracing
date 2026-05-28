@@ -1,0 +1,87 @@
+services:
+
+  # ── Application services ────────────────────────────────────────────────────
+
+  golang-service:
+    build: ./golang-service
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      # gRPC endpoint — no scheme for the Go gRPC client
+      OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+      PYTHON_SERVICE_URL: "http://python-service:8001"
+    networks:
+      - otel-net
+    depends_on:
+      otel-collector:
+        condition: service_started
+      python-service:
+        condition: service_started
+
+  python-service:
+    build: ./python-service
+    ports:
+      - "8001:8001"
+    environment:
+      PORT: "8001"
+      # gRPC endpoint — no scheme; OTLPSpanExporter connects directly via gRPC
+      OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+      OTEL_PROPAGATORS: "tracecontext,baggage"
+    networks:
+      - otel-net
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  # ── Observability stack ─────────────────────────────────────────────────────
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC (accessible from host for local testing)
+      - "4318:4318"   # OTLP HTTP
+    networks:
+      - otel-net
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.5.0
+    command: ["-config.file=/etc/tempo/config.yaml"]
+    volumes:
+      - ./tempo/config.yaml:/etc/tempo/config.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP API (queried by Grafana)
+    networks:
+      - otel-net
+    # Port 4317 is only internal; the collector reaches it via the Docker network
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - otel-net
+    depends_on:
+      - tempo
+
+volumes:
+  tempo-data:
+  grafana-data:
+
+networks:
+  otel-net:
+    driver: bridge
