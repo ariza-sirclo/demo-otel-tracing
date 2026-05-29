@@ -144,3 +144,141 @@ Don't propagate trace context at all. Instead, emit metrics with trace ID as an 
 
 **High-volume / sampling-heavy systems:**
 > **Strategy 3 (correlationId) + Strategy 6 (exemplars)** — trace a sample, correlate the rest via ID.
+
+---
+
+## Strategy #1 vs #5 — Detailed Comparison
+
+They share the same TraceID from start to finish, but differ in **span hierarchy** and **intent**.
+
+### #1 — Linear chain, each step is child of the previous
+
+```
+[span A: producer]
+    └── [span B: consumer-1]
+            └── [span C: consumer-2]
+```
+
+- Span A closes when the producer finishes publishing
+- Each span is child of the **previous** span — a chain
+- The root span (A) is already **closed** by the time consumers run
+- Fan-out becomes awkward nesting
+
+### #5 — Star topology, all steps are children of one saga root
+
+```
+[span ROOT: saga-create-order]  ← persisted in DB/Redis for entire saga lifetime
+    ├── [span A: payment-step]
+    ├── [span B: inventory-step]   ← siblings, not a chain
+    └── [span C: shipping-step]
+```
+
+- A dedicated root span is created to represent the whole business transaction
+- Root context is **persisted** in a saga state store, not just passed in a message
+- All steps — regardless of timing, order, or service — attach as **siblings of ROOT**
+- Fan-out is natural; retries don't corrupt lineage
+
+| | Strategy 1 | Strategy 5 |
+|---|---|---|
+| Hierarchy | Chain: A → B → C | Star: root → A, B, C |
+| Root span owner | First producer (closes early) | Saga orchestrator (spans whole flow) |
+| Fan-out | Awkward nested children | Natural siblings |
+| Root span lifetime | Short (producer request) | Long (entire saga duration) |
+| Context storage | Message attribute only | Message attribute + **persisted in DB** |
+| Use case | Simple pipeline, one path | Business transaction with branching/parallel steps |
+
+---
+
+## Recommendations for A → B → C + Master Data Broadcast
+
+### Primary pipeline: A → Pub/Sub → B → Pub/Sub → C
+
+Use **Strategy #1 (W3C child span)**.
+
+```
+[span A: service-A]
+    └── [span B: service-B]
+            └── [span C: service-C]
+```
+
+Inject `traceparent` + `baggage` into Pub/Sub message attributes. Each consumer extracts and creates a child span.
+
+**Go publisher:**
+```go
+carrier := propagation.MapCarrier{}
+otel.GetTextMapPropagator().Inject(ctx, carrier)
+msg := &pubsub.Message{
+    Data:       payload,
+    Attributes: carrier, // carries traceparent + baggage
+}
+topic.Publish(ctx, msg)
+```
+
+**Python consumer:**
+```python
+ctx = propagate.extract(dict(message.attributes))
+with tracer.start_as_current_span("pubsub-consume", context=ctx) as span:
+    user_id = get_baggage("user.id")  # baggage also restored
+```
+
+### Master data broadcast: 1 topic → many consumers
+
+Use **Strategy #2 (span links)**.
+
+```
+Producer [trace-1: span A] ──link──→ Consumer-X [trace-2: span B]
+                           ──link──→ Consumer-Y [trace-3: span C]
+                           ──link──→ Consumer-Z [trace-4: span D]
+```
+
+Each consumer is independent — span links let you navigate from producer to any consumer without false parent-child latency implications.
+
+---
+
+## Migration Path: #1 → #5 (when needed)
+
+The migration is **additive and non-breaking** — no flag day required.
+
+### Step 1: Add `x-root-traceparent` message attribute
+
+```
+Message Attributes (today, #1):
+  traceparent: "00-traceId-spanB-01"   ← changes at every hop
+
+Message Attributes (after, hybrid #1+#5):
+  traceparent: "00-traceId-spanB-01"   ← still changes (chain visibility)
+  x-root-traceparent: "00-traceId-spanA-01"  ← NEW: never changes, always = origin
+```
+
+### Step 2: Publisher seeds it once
+
+The **first service** that initiates the transaction sets `x-root-traceparent` if not already present:
+
+```go
+if _, exists := msg.Attributes["x-root-traceparent"]; !exists {
+    rootCarrier := propagation.MapCarrier{}
+    otel.GetTextMapPropagator().Inject(ctx, rootCarrier)
+    msg.Attributes["x-root-traceparent"] = rootCarrier["traceparent"]
+}
+```
+
+### Step 3: Consumers attach to root instead of previous span
+
+```go
+// Before (#1): child of whoever published
+ctx := propagator.Extract(ctx, messageAttrs)
+
+// After (#5): child of original root
+rootCarrier := MapCarrier{"traceparent": msg.Attributes["x-root-traceparent"]}
+rootCtx := propagator.Extract(context.Background(), rootCarrier)
+span := tracer.Start(rootCtx, "process-message")
+
+// Pass root through unchanged when publishing downstream
+outMsg.Attributes["x-root-traceparent"] = msg.Attributes["x-root-traceparent"]
+```
+
+### Rollout
+
+- Services that don't yet read `x-root-traceparent` continue working with #1 behavior
+- Migrate services one by one
+- No downtime, no coordination required
