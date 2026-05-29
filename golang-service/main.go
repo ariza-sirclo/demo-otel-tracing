@@ -9,8 +9,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/propagation"
@@ -20,6 +22,17 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// rdb is the shared Redis client used by the pub/sub handler.
+var rdb *redis.Client
+
+func initRedis() {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		addr = "redis:6379"
+	}
+	rdb = redis.NewClient(&redis.Options{Addr: addr})
+}
 
 func initTracer(ctx context.Context) (func(context.Context) error, error) {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -61,6 +74,57 @@ func initTracer(ctx context.Context) (func(context.Context) error, error) {
 	return tp.Shutdown, nil
 }
 
+// testPubSubHandler publishes a message to a Redis Stream, injecting the
+// current W3C traceparent + baggage into the message attributes (Strategy #1).
+// The PHP consumer extracts those attributes and creates a child span, forming
+// one continuous trace waterfall across both services.
+func testPubSubHandler(w http.ResponseWriter, r *http.Request) {
+	tracer := otel.Tracer("golang-service")
+	ctx, span := tracer.Start(r.Context(), "pubsub.publish")
+	defer span.End()
+
+	// Attach baggage so it travels with the trace context.
+	m1, _ := baggage.NewMember("user.id", "42")
+	bag, _ := baggage.New(m1)
+	ctx = baggage.ContextWithBaggage(ctx, bag)
+
+	// Strategy #1 — inject traceparent + baggage into a plain map carrier.
+	// The PHP consumer will call TraceContextPropagator::extract($fields) on
+	// these same keys to restore the parent context.
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+
+	// Build Redis Stream message: OTel keys + application payload.
+	fields := map[string]interface{}{
+		"payload": `{"event":"test-pubsub","data":"hello from golang-service"}`,
+	}
+	for k, v := range carrier {
+		fields[k] = v
+	}
+
+	msgID, err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: "demo-stream",
+		Values: fields,
+	}).Result()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("publish failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	span.SetAttributes(
+		attribute.String("messaging.system", "redis"),
+		attribute.String("messaging.destination", "demo-stream"),
+		attribute.String("messaging.message_id", msgID),
+		attribute.String("messaging.operation", "publish"),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w,
+		`{"service":"golang-service","stream":"demo-stream","message_id":%q,"strategy":"#1 W3C child span","traceparent":%q}`,
+		msgID, carrier["traceparent"],
+	)
+}
+
 func testTracingHandler(w http.ResponseWriter, r *http.Request) {
 	pythonURL := os.Getenv("PYTHON_SERVICE_URL")
 	if pythonURL == "" {
@@ -99,6 +163,8 @@ func testTracingHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	ctx := context.Background()
 
+	initRedis()
+
 	shutdown, err := initTracer(ctx)
 	if err != nil {
 		log.Fatalf("failed to initialise tracer: %v", err)
@@ -114,6 +180,10 @@ func main() {
 	mux.Handle("/test-tracing", otelhttp.NewHandler(
 		http.HandlerFunc(testTracingHandler),
 		"GET /test-tracing",
+	))
+	mux.Handle("/test-pubsub", otelhttp.NewHandler(
+		http.HandlerFunc(testPubSubHandler),
+		"GET /test-pubsub",
 	))
 
 	port := os.Getenv("PORT")
